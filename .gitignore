@@ -1,0 +1,22 @@
+# 虚拟环境（443 MB，按 requirements.txt 重建）
+.venv/
+venv/
+
+# 数据与产物：体积过大，不入库（outputs 102 GB / data 19 GB / data_all 13 GB）
+outputs/
+data/
+data_all/
+other/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 本机临时脚本（分析用的草稿，不属于交付物）
+tmp_*
+
+# 编辑器与本机工具配置
+.claude/
+.agents/
+.idea/
+.vscode/
