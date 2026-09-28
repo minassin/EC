@@ -2,7 +2,7 @@
 
 判定链（序号即优先级）：
     01 新用户
-    02 回流非高价值活跃用户（NHV）
+    02 回流非高价值活跃用户
     03/04/05 滑窗高价值活跃三态（稳定 / 回流 / 历史已退出）
     06 新近低频 → 07 高价值沉默风险 → 08 高频低价值 → 09 低频低价值 → 11 一般用户
 第 10 类「沉默高价值活跃」不在主表，单独出名单。
@@ -45,7 +45,7 @@ MAIN_TABLE_FILE = "user_behavior_rfm_segments.csv"
 STATION_TOP3_FILE = "user_station_top3_detail.csv"
 
 BUCKET_NEW = "新用户"
-BUCKET_NHV = "回流非高价值活跃用户（NHV）"
+BUCKET_NHV = "回流非高价值活跃用户"
 BUCKET_STABLE = "稳定高价值活跃用户"
 BUCKET_RETURNING_HV = "回流高价值活跃用户"
 BUCKET_EXITED_HV = "历史高价值活跃用户"
@@ -74,8 +74,12 @@ CODE_OF_BUCKET = {name: code for code, name in BUCKET_ORDER}
 
 STATE_STABLE = "稳定高价值活跃"
 STATE_RETURNING = "回流高价值活跃"
-STATE_EXITED = "历史高价值活跃（当前已退出）"
+STATE_EXITED = "历史高价值活跃"
 STATE_SILENT = "沉默高价值活跃"
+
+# 2026-09-28 前的 step 7 往「高价值活跃状态」里写的是带括号的旧名。旧产物不重跑也能用，
+# 见到旧名折算成新名；重跑 step 7 后这一层自然失效。
+LEGACY_STATE_ALIASES = {"历史高价值活跃（当前已退出）": STATE_EXITED}
 
 COUPON_MIN_ORDERS = 3
 COUPON_HIGH = 0.5
@@ -205,10 +209,10 @@ def main() -> None:
     ret_hv_keys = set(ret_keys[ret_is_hv]) if len(ret_keys) else set()
     abn_keys = set(key_series(abn_df)) if not abn_df.empty else set()
 
-    hv_state = keys.map(hv_state_map).fillna("")
+    hv_state = keys.map(hv_state_map).fillna("").replace(LEGACY_STATE_ALIASES)
     # 主表 = 近 90 天有有效订单；滑窗最后一个窗口比主表窗口早一天（滑窗 90 天 = 结束日-89），
     # 于是"末次充电恰好落在主表窗口首日"的极少数用户会被滑窗判为沉默。他们仍在主表内、近期有充电，
-    # 按「历史高价值活跃（当前已退出）」处理，避免与第 10 类沉默名单重复计数。
+    # 按「历史高价值活跃」处理，避免与第 10 类沉默名单重复计数。
     hv_state = hv_state.where(~hv_state.eq(STATE_SILENT), STATE_EXITED)
     r_score = pd.to_numeric(main_df.get("R分数"), errors="coerce")
     f_score = pd.to_numeric(main_df.get("F分数"), errors="coerce")

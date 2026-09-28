@@ -6,7 +6,7 @@ stations, aggregates to user-day grain, then walks backward by fixed steps.
 高价值活跃轨迹最终落到四态（互斥且完备）：
     稳定高价值活跃            只有一段高价值活跃，且最后一个窗口仍在该状态
     回流高价值活跃            两段及以上，且最后一个窗口仍在该状态
-    历史高价值活跃（当前已退出）  最后一个窗口已退出，但近 window_days 天仍有充电
+    历史高价值活跃            最后一个窗口已退出，但近 window_days 天仍有充电
     沉默高价值活跃            最后一个窗口已退出，且近 window_days 天完全没有充电
 第 4 态的判据是「用户不在最后一个窗口的明细里」，等价于「近 window_days 天无充电」。
 """
@@ -40,7 +40,7 @@ DEFAULT_HORIZON_DAYS = 180
 HIGH_VALUE_ACTIVE = "高价值活跃用户"
 STABLE_HIGH_VALUE = "稳定高价值活跃"
 RETURNING_HIGH_VALUE = "回流高价值活跃"
-EXITED_HIGH_VALUE = "历史高价值活跃（当前已退出）"
+EXITED_HIGH_VALUE = "历史高价值活跃"
 SILENT_HIGH_VALUE = "沉默高价值活跃"
 HIGH_VALUE_STATES = (STABLE_HIGH_VALUE, RETURNING_HIGH_VALUE, EXITED_HIGH_VALUE, SILENT_HIGH_VALUE)
 
