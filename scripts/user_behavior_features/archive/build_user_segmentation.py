@@ -18,13 +18,27 @@
 输出（<label>/segments/）：
     user_segments.csv                       主表逐户落桶结果（含附加条件、回显列与偏好 TOP1-3）
     user_segments_core7.csv                 上述主表的子表，只留 7 类重点人群
-    user_segments_silent_high_value.csv     第 10 类单独名单
+    user_segments_silent_high_value.csv     第 10 类单独名单（含全量订单数与偏好 TOP1-3）
     user_segments_overview.csv              人数分布
     user_segments_checks.csv                校验断言结果
 
 「偏好站点/时段 TOP1-3」的填法：除「样本不足」外，一律按实际数据填满三列——
 用户只用过 1 个站点就只填 TOP1、用过 2 个填到 TOP2，填不满的位置写「无」。
 「样本不足」（有效订单 ≤ 5）不算有偏好，三列都写「无」。改口径动下面两个常量。
+
+主表与沉默名单的偏好来源不同，这是二者的根本差别：
+    主表       偏好取自 90 天窗口的特征产物，口径 = 窗口内有效订单
+    沉默名单   这批人「近 90 天没充电」，在窗口产物里根本不存在（实测交集为 0），
+               所以回清洗表 outputs/runs/<label>/cleaned/<label>_standard_user_orders.csv
+               按**全量历史**重算，口径 = 存量清洗表全表（2025-12-31 ~ 2026-08-27）。
+               同一列名在两表里的统计口径因此不同，跨表比对时要注意。
+               补算要扫一遍全量清洗表，用 --skip-silent-detail 可跳过（订单数写 0、偏好写「无」）。
+
+`订单总数(全量)` 只出现在沉默名单：主表的订单数是窗口内计数，对「近 90 天没充电」的人
+恒为 0，没有意义。全量值中位数仅 3 单——沉默名单里 83% 落在「样本不足」，是真实分布，
+不是算错。这批人之所以曾被判高价值活跃，是滑窗的「动态统计天数」有 14 天下限
+（build_rfm_sliding_windows.py:366），窗口内只充 1 次也能拿到 F=1、进而满足
+`R≤2 且 F≤2 且 M≥4`。属滑窗设计的既有特性，非本次改动引入。
 """
 
 from __future__ import annotations
@@ -32,13 +46,23 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
 
+from build_user_behavior_features_pipeline import (
+    BUS_STATION_CATEGORY,
+    station_concentration_features,
+    station_preference_type,
+    time_concentration_features,
+    time_preference_type,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 OUTPUT_ROOT = Path(os.environ.get("EC_OUTPUT_ROOT", PROJECT_ROOT / "outputs"))
 ARCHIVE_FEATURE_ROOT = OUTPUT_ROOT / "features" / "archive"
+RUNS_ROOT = OUTPUT_ROOT / "runs"
 
 DEFAULT_LABEL = "mysql_run"
 MAIN_TABLE_FILE = "user_behavior_rfm_segments.csv"
@@ -97,6 +121,13 @@ PREFERENCE_TOP_SLOTS = 3
 
 PREFERENCE_STATION_COLUMNS = ["偏好站点TOP1", "偏好站点TOP2", "偏好站点TOP3"]
 PREFERENCE_TIME_COLUMNS = ["偏好时段TOP1", "偏好时段TOP2", "偏好时段TOP3"]
+PREFERENCE_COLUMNS = PREFERENCE_STATION_COLUMNS + PREFERENCE_TIME_COLUMNS
+
+# 沉默名单专用：这些人不在 90 天窗口的任何特征产物里，只能回清洗表按全量历史重算，
+# 所以订单数不能叫「订单总数」（主表那个是 90 天内的），带后缀区分口径。
+ORDER_COUNT_COLUMN = "订单总数(全量)"
+SILENT_TYPES = ["站点偏好类型", "时段偏好类型"]
+SILENT_DETAIL_COLUMNS = [ORDER_COUNT_COLUMN] + SILENT_TYPES + PREFERENCE_COLUMNS
 
 # user_segments.csv 的子表只留这 7 类（顺序即输出顺序）。
 CORE_BUCKETS = [
@@ -115,6 +146,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label", default=DEFAULT_LABEL, help="输出批次名，默认 mysql_run。")
     parser.add_argument("--rfm-file", type=Path, help="主表文件，默认 <label>/user_behavior_rfm_segments.csv。")
     parser.add_argument("--output-dir", type=Path, help="输出目录，默认 <label>/segments。")
+    parser.add_argument(
+        "--cleaned-file",
+        type=Path,
+        help="清洗表，用来给沉默名单补偏好与订单数，默认 outputs/runs/<label>/cleaned/<label>_standard_user_orders.csv。",
+    )
+    parser.add_argument(
+        "--skip-silent-detail",
+        action="store_true",
+        help="跳过沉默名单的偏好与订单数补算（那步要扫一遍全量清洗表）。",
+    )
     return parser.parse_args()
 
 
@@ -143,6 +184,91 @@ def level_of(values: pd.Series, orders: pd.Series, sample_min: int, high: float,
     out[enough & numeric.ge(mid) & numeric.lt(high)] = "中"
     out[enough & numeric.ge(high)] = "高"
     return out
+
+
+def silent_history_detail(cleaned_file: Path, silent_keys: set[str]) -> pd.DataFrame:
+    """给沉默名单补偏好与订单数——回清洗表按**全量历史**重算。
+
+    沉默高价值活跃的定义就是「近 90 天没充电」，所以这批人不在任何 90 天窗口的产物里
+    （主表、站点/时段明细、订单基表都与他们交集为 0），只能回原始清洗表算。
+    代价是这一列的口径和主表不同：这里是该用户在本批清洗表全时段内的累计，
+    列名用「订单总数(全量)」区分。
+
+    订单筛选与第 5 步一致：只取「是否有效行为订单 = 是」且非公交场站的订单；
+    偏好类型与集中度直接复用第 5 步的 station_preference_type / time_preference_type，
+    保证同一套阈值。
+    """
+    if not silent_keys:
+        return pd.DataFrame()
+
+    if not cleaned_file.exists():
+        print(f"提示：未找到清洗表 {cleaned_file}，沉默名单的偏好与订单数按空处理。")
+        print("      用 --cleaned-file 指定，或 --skip-silent-detail 显式跳过。")
+        return pd.DataFrame()
+
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute("PRAGMA threads=4")
+    con.register("silent", pd.DataFrame({"用户识别主键": sorted(silent_keys)}))
+    orders = con.execute(
+        """
+        SELECT
+            b."用户识别主键" AS 用户识别主键,
+            b."充电站ID" AS 充电站ID,
+            b."充电粗略时段" AS 充电粗略时段
+        FROM read_csv(?, header=true, all_varchar=true, ignore_errors=true) b
+        SEMI JOIN silent s ON b."用户识别主键" = s."用户识别主键"
+        WHERE COALESCE(NULLIF(TRIM(b."是否有效行为订单"), ''), '') = '是'
+          AND COALESCE(NULLIF(TRIM(b."场站类别"), ''), '') <> ?
+        """,
+        [str(cleaned_file), BUS_STATION_CATEGORY],
+    ).fetchdf()
+    con.close()
+
+    def values(series: pd.Series) -> list[str]:
+        return [v for v in series.fillna("").astype(str).str.strip() if v]
+
+    rows = []
+    for user_key, group in orders.groupby("用户识别主键", sort=False):
+        total = int(len(group))
+        stations = Counter(values(group["充电站ID"]))
+        periods = Counter(values(group["充电粗略时段"]))
+        station_row: dict[str, object] = {"订单总数": total, "使用站点数": len(stations)}
+        station_row.update(station_concentration_features(stations))
+        period_row: dict[str, object] = {"订单总数": total}
+        period_row.update(time_concentration_features(periods))
+        station_top = stations.most_common(3)
+        period_top = periods.most_common(3)
+        rows.append(
+            {
+                "用户识别主键": user_key,
+                ORDER_COUNT_COLUMN: total,
+                SILENT_TYPES[0]: station_preference_type(pd.Series(station_row)),
+                SILENT_TYPES[1]: time_preference_type(pd.Series(period_row)),
+                PREFERENCE_STATION_COLUMNS[0]: station_top[0][0] if station_top else "",
+                PREFERENCE_STATION_COLUMNS[1]: station_top[1][0] if len(station_top) > 1 else "",
+                PREFERENCE_STATION_COLUMNS[2]: station_top[2][0] if len(station_top) > 2 else "",
+                PREFERENCE_TIME_COLUMNS[0]: period_top[0][0] if period_top else "",
+                PREFERENCE_TIME_COLUMNS[1]: period_top[1][0] if len(period_top) > 1 else "",
+                PREFERENCE_TIME_COLUMNS[2]: period_top[2][0] if len(period_top) > 2 else "",
+            }
+        )
+
+    detail = pd.DataFrame(rows)
+    if detail.empty:
+        return detail
+    # 偏好三列按类型口径摊平（样本不足 / 实际不足三位 -> 无）
+    filled = pd.concat(
+        [
+            preference_top3(detail[SILENT_TYPES[0]], [detail[c] for c in PREFERENCE_STATION_COLUMNS], PREFERENCE_STATION_COLUMNS),
+            preference_top3(detail[SILENT_TYPES[1]], [detail[c] for c in PREFERENCE_TIME_COLUMNS], PREFERENCE_TIME_COLUMNS),
+        ],
+        axis=1,
+    )
+    for column in PREFERENCE_COLUMNS:
+        detail[column] = filled[column]
+    return detail.set_index("用户识别主键")
 
 
 def preference_top3(pref_type: pd.Series, sources: list[pd.Series], columns: list[str]) -> pd.DataFrame:
@@ -294,7 +420,34 @@ def main() -> None:
         silent_end = pd.to_datetime(silent_out["高价值活跃结束日期"], errors="coerce")
         silent_out["距高价值退出天数"] = "" if pd.isna(last_charge) else (last_charge.normalize() - silent_end).dt.days
 
+    cleaned_file = args.cleaned_file or (RUNS_ROOT / args.label / "cleaned" / f"{args.label}_standard_user_orders.csv")
+    if args.skip_silent_detail:
+        silent_detail = pd.DataFrame()
+        print("已跳沉默名单的偏好与订单数补算（--skip-silent-detail）")
+    else:
+        print(f"沉默名单补算：{len(silent_keys):,} 人，回清洗表 {cleaned_file} 按全量历史重算……")
+        silent_detail = silent_history_detail(cleaned_file, silent_keys)
+    silent_matched = 0
+    for column in SILENT_DETAIL_COLUMNS:
+        if silent_detail.empty:
+            silent_out[column] = "" if column == ORDER_COUNT_COLUMN else NONE_FILL
+            continue
+        mapped = silent_out["用户识别主键"].map(silent_detail[column])
+        if column == ORDER_COUNT_COLUMN:
+            silent_matched = int(mapped.notna().sum())
+            silent_out[column] = mapped.fillna(0).astype(int)
+        else:
+            silent_out[column] = mapped.fillna(NONE_FILL)
+    if not silent_detail.empty:
+        print(f"沉默名单补算完成：命中 {silent_matched:,} / {len(silent_out):,} 人")
+
     core = out[out["最终分群"].isin(CORE_BUCKETS)]
+    # 站点/时段偏好类型共用「有效订单 <= 5 即样本不足」这一个门槛
+    # （build_user_behavior_features_pipeline.py 的 station_preference_type / time_preference_type），
+    # 所以两侧「有偏好」的人必然是同一批、计数必然相等。这里顺带断言这个恒等式。
+    pref_station_mask = out["站点偏好类型"].fillna("").astype(str).str.strip().isin(NO_PREFERENCE_TYPES)
+    pref_time_mask = out["时段偏好类型"].fillna("").astype(str).str.strip().isin(NO_PREFERENCE_TYPES)
+    pref_gate_aligned = bool(pref_station_mask.eq(pref_time_mask).all())
     core_pref_station = int(core[PREFERENCE_STATION_COLUMNS[0]].ne(NONE_FILL).sum())
     core_pref_time = int(core[PREFERENCE_TIME_COLUMNS[0]].ne(NONE_FILL).sum())
 
@@ -325,6 +478,7 @@ def main() -> None:
         ("七类子表人数 = 主表命中人数", len(core) == int(counts.reindex(CORE_BUCKETS).fillna(0).sum()), f"{len(core):,} vs {int(counts.reindex(CORE_BUCKETS).fillna(0).sum()):,}"),
         ("七类子表不含其它分群", set(core["最终分群"].unique()) <= set(CORE_BUCKETS), "、".join(sorted(set(core["最终分群"].unique()) - set(CORE_BUCKETS))) or "无越界值"),
         ("偏好 TOP1 只写「有偏好」的用户", core_pref_station <= len(core) and core_pref_time <= len(core), f"站点 {core_pref_station:,} 人、时段 {core_pref_time:,} 人"),
+        ("站点/时段「样本不足」掩码一致（共用订单数门槛）", pref_gate_aligned, "两侧必然同进同出，不等说明门槛被单独改过"),
         ("「样本不足」的偏好三列全为「无」", bool(
             (out.loc[out["站点偏好类型"].isin(NO_PREFERENCE_TYPES), PREFERENCE_STATION_COLUMNS] == NONE_FILL).all().all()
             and (out.loc[out["时段偏好类型"].isin(NO_PREFERENCE_TYPES), PREFERENCE_TIME_COLUMNS] == NONE_FILL).all().all()
@@ -332,6 +486,14 @@ def main() -> None:
         ("偏好六列无空值（只可能是取值或「无」）", bool(
             out[PREFERENCE_STATION_COLUMNS + PREFERENCE_TIME_COLUMNS].ne("").all().all()
         ), "填不满的位置已统一写「无」，不留空串"),
+        ("沉默名单补算覆盖全部用户", silent_detail.empty or silent_matched == len(silent_out), f"命中 {silent_matched:,} / {len(silent_out):,}"),
+        ("沉默名单偏好六列无空值", bool(silent_out[PREFERENCE_COLUMNS].ne("").all().all()), "填不满的位置统一写「无」"),
+        ("沉默名单「样本不足」的偏好三列全为「无」", bool(
+            silent_out.empty or (
+                (silent_out.loc[silent_out["站点偏好类型"].isin(NO_PREFERENCE_TYPES), PREFERENCE_STATION_COLUMNS] == NONE_FILL).all().all()
+                and (silent_out.loc[silent_out["时段偏好类型"].isin(NO_PREFERENCE_TYPES), PREFERENCE_TIME_COLUMNS] == NONE_FILL).all().all()
+            )
+        ), "与主表同一套填法"),
     ]
     warn_checks = {"单桶人数 < 100 需告警"}
     check_df = pd.DataFrame(
@@ -356,7 +518,21 @@ def main() -> None:
     print()
     print("七类子表（user_segments_core7.csv）：")
     print(pd.DataFrame([{"分群": name, "人数": int(core_counts.get(name, 0))} for name in CORE_BUCKETS]).to_string(index=False))
-    print(f"其中 站点偏好 TOP1 非「无」{core_pref_station:,} 人、时段偏好 TOP1 非「无」{core_pref_time:,} 人")
+    print(f"其中 偏好 TOP1 非「无」：站点 {core_pref_station:,} 人、时段 {core_pref_time:,} 人")
+    print("（两者相等是结构性的：站点/时段偏好类型共用「有效订单 <= 5 即样本不足」这一个门槛）")
+    print()
+    print(f"第 10 类沉默高价值活跃（user_segments_silent_high_value.csv）：{len(silent_out):,} 人")
+    if silent_detail.empty:
+        print("  偏好与订单数未补算（--skip-silent-detail）")
+    else:
+        for silent_column in SILENT_TYPES:
+            type_counts = silent_out[silent_column].value_counts()
+            print(f"  {silent_column}：" + " / ".join(f"{name} {int(value):,}" for name, value in type_counts.items()))
+        order_counts = pd.to_numeric(silent_out[ORDER_COUNT_COLUMN], errors="coerce")
+        print(
+            f"  {ORDER_COUNT_COLUMN}：中位数 {order_counts.median():.0f}、"
+            f"均值 {order_counts.mean():.2f}、最大 {order_counts.max():.0f}"
+        )
     print()
     print(check_df.to_string(index=False))
     print()

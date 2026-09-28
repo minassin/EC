@@ -189,10 +189,12 @@ outputs\features\archive\<批次名>\
   └─ segments\                        第 9 步
        ├─ user_segments.csv               主表全量落桶（含偏好站点/时段 TOP1-3）
        ├─ user_segments_core7.csv         上面这张表的子表，只留 7 类重点人群
-       ├─ user_segments_silent_high_value.csv
+       ├─ user_segments_silent_high_value.csv  第 10 类沉默名单（含全量订单数与偏好 TOP1-3）
        ├─ user_segments_overview.csv
        └─ user_segments_checks.csv
 ```
+
+**沉默名单的偏好列口径与主表不同（别混用）**：第 10 类的人「近 90 天没充电」，在 90 天窗口的任何特征产物里都不存在（实测交集为 0），所以 `user_segments_silent_high_value.csv` 的 `订单总数(全量)` 与偏好类型、偏好 TOP1-3 是**回清洗表按全量历史重算**的（口径 = 清洗表全表，非 90 天窗口）。补算要扫一遍全量清洗表，`--skip-silent-detail` 可跳过，`--cleaned-file` 可指定别的清洗表。该批人订单总数中位数仅 3 单、83% 落在「样本不足」，所以偏好三列多为「无」——是真实分布，不是算错。
 
 ### 8. 每步耗时怎么看
 
