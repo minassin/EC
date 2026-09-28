@@ -12,6 +12,7 @@
 - v0.8 变更：**落地 A 方案**——`build_recent_user_segments.py` 的 base 补上主表同款过滤 `场站类别 <> 公交场站`，新用户 / 回流 / 异常终止三份名单与主表彻底同源，名单缺口由 198 人降为 0；据此重算全部人数（01/02/03/06/08/09/11 有 ±1~46 变动），并修正 6.4 的错误解释。
 - v0.8（补充，9/21）：`build_rfm_sliding_windows.py` 把高价值活跃轨迹改为**直接输出四态**——第 4 态「沉默高价值活跃」的判据写进脚本（用户不在最后一个窗口的明细里，等价于近 90 天无充电），下游不再需要拿主表反推 05/10。重跑实测：稳定 5,387、回流 2,566、历史高价值活跃（当前已退出）18,924、沉默高价值活跃 848，合计 27,725。
 - v0.9 变更：**落桶脚本已实现**——`build_user_segmentation.py` 按第 4 节判定链输出 `segments/`，第 7 节校验断言全部写进脚本（见 4.2）。
+- v0.10 变更：落桶结果新增 `偏好站点TOP1/2/3`、`偏好时段TOP1/2/3` 六列，并新增七类子表 `user_segments_core7.csv`（见 4.2、4.3）。**注意**：本轮 `站点偏好类型` 里「双站点用户」「三站点用户」各 0 人——不是数据如此，而是第 5 步 duckdb 路径漏吐 `前二/前三站点占比`、`前二/前三站点最小占比` 四列，`station_preference_type` 读到 0 导致这两个分支不可达。已在 `build_user_behavior_features_pipeline.py` 的 `top_station_cte()` 里补上（含 SQL 与原 pandas 口径的一致性验证），**待重跑第 5 步后这两个类型才会出现**，届时站点侧 TOP2/TOP3 才有实际内容。
 - 本文档只定义口径，不含实现。
 
 ## 1. 口径原则
@@ -96,8 +97,9 @@
 
 - 脚本：`scripts/user_behavior_features/archive/build_user_segmentation.py`（只读产物落桶，不重算口径）。
 - 运行：`.venv\Scripts\python.exe scripts\user_behavior_features\archive\build_user_segmentation.py --label mysql_run`
-- 输入：`user_behavior_rfm_segments.csv`（主表 + R/F/M 分数 + 附加条件原料）、`sliding_windows/high_value_active_periods.csv`（四态）、`recent_user_segments/new_users_7d.csv` / `returning_users_7d.csv` / `recent_abnormal_14d.csv`。
-- 输出（`<label>/segments/`）：`user_segments.csv`（主表 307,950 行：`用户识别主键 / 用户编码 / 最终分群序号 / 最终分群` + 附加条件与回显列）、`user_segments_silent_high_value.csv`（第 10 类单独名单）、`user_segments_overview.csv`（人数分布）、`user_segments_checks.csv`（校验断言）。
+- 输入：`user_behavior_rfm_segments.csv`（主表 + R/F/M 分数 + 附加条件原料）、`sliding_windows/high_value_active_periods.csv`（四态）、`recent_user_segments/new_users_7d.csv` / `returning_users_7d.csv` / `recent_abnormal_14d.csv`、`user_station_top3_detail.csv`（站点前三，取 `第1/2/3站点ID`，**可选**——缺文件时偏好站点三列全写「无」并打印提示）。
+- 输出（`<label>/segments/`）：`user_segments.csv`（主表全量：`用户识别主键 / 用户编码 / 最终分群序号 / 最终分群` + 附加条件、回显列、偏好 TOP1-3）、`user_segments_core7.csv`（**主表子表，只留第 4.3 节那 7 类**，列结构与主表一致）、`user_segments_silent_high_value.csv`（第 10 类单独名单）、`user_segments_overview.csv`（人数分布）、`user_segments_checks.csv`（校验断言）。
+- **偏好 TOP1-3（v0.10）**：新增 `偏好站点TOP1/2/3`、`偏好时段TOP1/2/3` 六列。除「样本不足」（有效订单 ≤ 5）三列全写「无」外，其余类型一律按实际数据填——站点取值来自 `user_station_top3_detail.csv` 的 `第1/2/3站点ID`，时段取值来自主表的 `主充电时段 / 次充电时段 / 第三充电时段`；用户实际只有 1/2 个站点或时段时，后面的位置写「无」。口径由脚本顶部的 `NO_PREFERENCE_TYPES` / `PREFERENCE_TOP_SLOTS` 两个常量控制。
 - 02 的取值直接读回流表的 `180天内是否出现高价值活跃`（缺列时自动回退为「是否出现在滑窗高价值活跃产物里」）。
 - 任一「未通过」校验会让脚本以退出码 1 结束；「单桶人数 < 100」按设计计为告警而非失败。
 
@@ -113,6 +115,24 @@
 | 06~09 | 新近低频 / 高价值沉默风险 / 高频低价值 / 低频低价值 | 06~09 |
 | 10 | 沉默高价值活跃 | 原滑窗第 4 态（原 6.1 节，848 人） |
 | 11 | 一般用户 | 10 |
+
+### 4.3 七类子表（`user_segments_core7.csv`）
+
+主表全量太大，日常运营只关心下面 7 类，单独出一份子表。**行是主表的子集，列结构与主表完全一致**，只是过滤了 `最终分群`：
+
+| 序号 | 分群 |
+| --- | --- |
+| 01 | 新用户 |
+| 02 | 回流非高价值活跃用户（NHV） |
+| 03 | 稳定高价值活跃用户 |
+| 04 | 回流高价值活跃用户 |
+| 05 | 历史高价值活跃用户 |
+| 06 | 新近低频用户 |
+| 07 | 高价值沉默风险用户 |
+
+被排除的是 08 高频低价值、09 低频低价值、11 一般用户（第 10 类沉默高价值活跃本来就不在主表内，在 `user_segments_silent_high_value.csv`）。子表人数 = 这 7 类在主表的人数之和，已写成校验断言。
+
+改动子表范围只需动脚本顶部的 `CORE_BUCKETS` 列表。
 
 ## 5. 附加条件与辅助列（均不进主枚举）
 
@@ -247,3 +267,4 @@
 4. `run_mysql_full_pipeline.py` 存在两个 `def main()`（:262 死代码，:469 生效）。
 5. 文档中的 `final_user_behavior_features.csv` 实际名为 `final_user_behavior_profile.csv`。
 6. `recent_user_segments/new_users_7d.csv` 只回看 180 天，而原始数据自 2020-01-01 起，会把有更早历史的老用户算作新用户（6,723 人中至少 1,465 人属此情况）。该口径还导致 539 名「新用户」在 180 天滑动窗口内仍有高价值活跃记录（520 稳定 + 19 已退出），被 01 桶抢先吸收，修复后需重新落桶。（其中「公交场站过滤缺失」部分已于 v0.8 修复。）
+7. ~~`站点偏好类型` 判不出「双站点用户」「三站点用户」~~（v0.10 已修代码，待重跑第 5 步）：第 5 步 duckdb 路径的 `top_cte` 只吐 `主站点ID / 主站点占比 / 使用站点数`，漏了 `前二站点占比`、`前三站点占比`、`前二站点最小占比`、`前三站点最小占比`——而这四列只在 pandas 回退路径的 `station_concentration_features()` 里生成。duckdb 路径下 `station_preference_type` 的 `row.get(..., 0)` 恒取 0，两个分支不可达。时段侧不受影响（那几列 duckdb 有吐），故单/双/三时段偏好均正常出现。已在 `top_station_cte()` 补上四列，并用合成数据与 pandas 版逐列比对（最大偏差 0）确认口径一致。

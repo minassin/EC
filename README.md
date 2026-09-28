@@ -183,9 +183,15 @@ outputs\features\archive\<批次名>\
   ├─ user_behavior_rfm_segments.csv   RFM 分层
   ├─ final_user_behavior_profile.csv  最终画像
   ├─ final_user_behavior_labels.csv   最终标签
+  ├─ user_station_top3_detail.csv     站点前三明细（第 9 步的偏好站点取这里）
   ├─ sliding_windows\                 第 7 步
   ├─ recent_user_segments\            第 8 步
   └─ segments\                        第 9 步
+       ├─ user_segments.csv               主表全量落桶（含偏好站点/时段 TOP1-3）
+       ├─ user_segments_core7.csv         上面这张表的子表，只留 7 类重点人群
+       ├─ user_segments_silent_high_value.csv
+       ├─ user_segments_overview.csv
+       └─ user_segments_checks.csv
 ```
 
 ### 8. 每步耗时怎么看
@@ -234,3 +240,11 @@ ModuleNotFoundError: No module named 'reporting_utils'
 ```
 
 另外一个口径细节：数据只覆盖单一年份时，手写 SVG 那套直接对整帧出图（保留「充电开始时间」为空的行），这是为了对齐历史图型，改动会让图对不上。
+
+### 5. 第 5 步站点偏好判不出「双站点用户」「三站点用户」
+
+`站点偏好类型` 要读 `前二站点占比`、`前三站点占比`、`前二站点最小占比`、`前三站点最小占比` 四个字段，但第 5 步走 duckdb 路径时 `top_cte` 只吐 `主站点ID / 主站点占比 / 使用站点数`，这四列**从未生成**（它们只存在于 pandas 回退路径的 `station_concentration_features()`）。判定函数里的 `row.get(..., 0)` 于是恒为 0，两个分支不可达——实测 200 万人里各 0 人。
+
+时段侧不受影响（duckdb 有吐那几个占比列），所以单/双/三时段偏好都正常出现。
+
+**代码已在 v0.10 修好**（[`build_user_behavior_features_pipeline.py`](scripts/user_behavior_features/archive/build_user_behavior_features_pipeline.py) 里新增 `top_station_cte()`），但**需要重跑第 5 步才会生效**；重跑前第 9 步产出的 `偏好站点TOP2/TOP3` 基本只有 `固定站点用户` 有值。详见 [docs/segment_definition.md](docs/segment_definition.md) 第 9 节第 7 条。

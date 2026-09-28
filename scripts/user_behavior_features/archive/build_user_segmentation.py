@@ -13,12 +13,18 @@
     recent_user_segments/new_users_7d.csv
     recent_user_segments/returning_users_7d.csv
     recent_user_segments/recent_abnormal_14d.csv
+    user_station_top3_detail.csv                   站点前三明细（取第1/2/3站点ID，可选）
 
 输出（<label>/segments/）：
-    user_segments.csv                       主表逐户落桶结果（含附加条件与回显列）
+    user_segments.csv                       主表逐户落桶结果（含附加条件、回显列与偏好 TOP1-3）
+    user_segments_core7.csv                 上述主表的子表，只留 7 类重点人群
     user_segments_silent_high_value.csv     第 10 类单独名单
     user_segments_overview.csv              人数分布
     user_segments_checks.csv                校验断言结果
+
+「偏好站点/时段 TOP1-3」的填法：除「样本不足」外，一律按实际数据填满三列——
+用户只用过 1 个站点就只填 TOP1、用过 2 个填到 TOP2，填不满的位置写「无」。
+「样本不足」（有效订单 ≤ 5）不算有偏好，三列都写「无」。改口径动下面两个常量。
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ ARCHIVE_FEATURE_ROOT = OUTPUT_ROOT / "features" / "archive"
 
 DEFAULT_LABEL = "mysql_run"
 MAIN_TABLE_FILE = "user_behavior_rfm_segments.csv"
+STATION_TOP3_FILE = "user_station_top3_detail.csv"
 
 BUCKET_NEW = "新用户"
 BUCKET_NHV = "回流非高价值活跃用户（NHV）"
@@ -77,6 +84,27 @@ VALLEY_MIN_ORDERS = 3
 VALLEY_HIGH = 0.5
 VALLEY_MID = 0.25
 
+NONE_FILL = "无"
+
+# 「样本不足」（有效订单 ≤ 5）不认为有偏好，偏好 TOP1-3 三列全写「无」；
+# 其余类型一律按实际数据填，用户实际只有 1/2 个站点或时段时，后面的位置写「无」。
+NO_PREFERENCE_TYPES = {"样本不足"}
+PREFERENCE_TOP_SLOTS = 3
+
+PREFERENCE_STATION_COLUMNS = ["偏好站点TOP1", "偏好站点TOP2", "偏好站点TOP3"]
+PREFERENCE_TIME_COLUMNS = ["偏好时段TOP1", "偏好时段TOP2", "偏好时段TOP3"]
+
+# user_segments.csv 的子表只留这 7 类（顺序即输出顺序）。
+CORE_BUCKETS = [
+    BUCKET_NEW,
+    BUCKET_NHV,
+    BUCKET_STABLE,
+    BUCKET_RETURNING_HV,
+    BUCKET_EXITED_HV,
+    BUCKET_LOW_FREQ_RECENT,
+    BUCKET_HV_SILENT_RISK,
+]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="把主表用户落成 11 类互斥分群，并输出校验断言。")
@@ -113,6 +141,20 @@ def level_of(values: pd.Series, orders: pd.Series, sample_min: int, high: float,
     return out
 
 
+def preference_top3(pref_type: pd.Series, sources: list[pd.Series], columns: list[str]) -> pd.DataFrame:
+    """把 top1..top3 的取值摊成三列，填不满的位置写「无」。
+
+    「样本不足」不算有偏好，三列全「无」；其余类型按实际数据填，
+    源值为空（比如用户只用过 1 个站点，第2站点ID 为空）的位置也写「无」。
+    """
+    allowed = ~pref_type.fillna("").astype(str).str.strip().isin(NO_PREFERENCE_TYPES)
+    filled = {}
+    for column, source in list(zip(columns, sources))[:PREFERENCE_TOP_SLOTS]:
+        values = source.fillna("").astype(str).str.strip()
+        filled[column] = values.where(allowed & values.ne(""), NONE_FILL)
+    return pd.DataFrame(filled, index=pref_type.index)
+
+
 def main() -> None:
     args = parse_args()
     label_dir = ARCHIVE_FEATURE_ROOT / args.label
@@ -129,6 +171,25 @@ def main() -> None:
     hv_state_map = dict(zip(hv_keys, hv_df.get("高价值活跃状态", pd.Series("", index=hv_df.index)).fillna("").astype(str).str.strip()))
     hv_seg_map = dict(zip(hv_keys, pd.to_numeric(hv_df.get("高价值活跃段数", 0), errors="coerce")))
     hv_end_map = dict(zip(hv_keys, hv_df.get("高价值活跃结束日期", pd.Series("", index=hv_df.index)).fillna("").astype(str).str.strip()))
+
+    station_top3_file = label_dir / STATION_TOP3_FILE
+    if station_top3_file.exists():
+        station_top3 = pd.read_csv(
+            station_top3_file,
+            encoding="utf-8-sig",
+            low_memory=False,
+            usecols=["用户识别主键", "第1站点ID", "第2站点ID", "第3站点ID"],
+        )
+        station_by_key = station_top3.set_index(key_series(station_top3))
+    else:
+        print(f"提示：未找到站点前三明细 {station_top3_file}，偏好站点三列全部写「无」。")
+        station_by_key = pd.DataFrame(columns=["第1站点ID", "第2站点ID", "第3站点ID"])
+
+    def station_slot(position: int) -> pd.Series:
+        column = f"第{position}站点ID"
+        if column not in station_by_key.columns:
+            return pd.Series("", index=main_df.index)
+        return keys.map(station_by_key[column]).fillna("")
 
     new_df = optional_csv(label_dir / "recent_user_segments" / "new_users_7d.csv")
     ret_df = optional_csv(label_dir / "recent_user_segments" / "returning_users_7d.csv")
@@ -168,6 +229,19 @@ def main() -> None:
         bucket[mask.fillna(False)] = name
     bucket_before_extra_columns = bucket.copy()
 
+    def text_column(name: str) -> pd.Series:
+        return main_df.get(name, pd.Series("", index=main_df.index)).fillna("").astype(str).str.strip()
+
+    station_pref = text_column("站点偏好类型")
+    time_pref = text_column("时段偏好类型")
+    preference = pd.concat(
+        [
+            preference_top3(station_pref, [station_slot(i) for i in (1, 2, 3)], PREFERENCE_STATION_COLUMNS),
+            preference_top3(time_pref, [text_column("主充电时段"), text_column("次充电时段"), text_column("第三充电时段")], PREFERENCE_TIME_COLUMNS),
+        ],
+        axis=1,
+    )
+
     out = pd.DataFrame(
         {
             "用户识别主键": keys,
@@ -185,11 +259,13 @@ def main() -> None:
             "主充电时段": main_df.get("主充电时段", pd.Series("", index=main_df.index)).fillna("").astype(str).str.strip(),
             "单次高消费标记": ((orders.eq(1)) & (m_score.ge(4))).map({True: "是", False: "否"}),
             "价格敏感等级": main_df.get("价格敏感等级", pd.Series("", index=main_df.index)).fillna("").astype(str).str.strip(),
-            "站点偏好类型": main_df.get("站点偏好类型", pd.Series("", index=main_df.index)).fillna("").astype(str).str.strip(),
-            "时段偏好类型": main_df.get("时段偏好类型", pd.Series("", index=main_df.index)).fillna("").astype(str).str.strip(),
+            "站点偏好类型": station_pref,
+            "时段偏好类型": time_pref,
             "异常风险等级": main_df.get("异常风险等级", pd.Series("", index=main_df.index)).fillna("").astype(str).str.strip(),
         }
     )
+    for column in PREFERENCE_STATION_COLUMNS + PREFERENCE_TIME_COLUMNS:
+        out[column] = preference[column]
 
     last_charge = pd.to_datetime(main_df.get("最近充电时间"), errors="coerce").max()
     hv_end = pd.to_datetime(keys.map(hv_end_map), errors="coerce")
@@ -213,6 +289,10 @@ def main() -> None:
     if not silent_out.empty:
         silent_end = pd.to_datetime(silent_out["高价值活跃结束日期"], errors="coerce")
         silent_out["距高价值退出天数"] = "" if pd.isna(last_charge) else (last_charge.normalize() - silent_end).dt.days
+
+    core = out[out["最终分群"].isin(CORE_BUCKETS)]
+    core_pref_station = int(core[PREFERENCE_STATION_COLUMNS[0]].ne(NONE_FILL).sum())
+    core_pref_time = int(core[PREFERENCE_TIME_COLUMNS[0]].ne(NONE_FILL).sum())
 
     counts = out["最终分群"].value_counts()
     overview = pd.DataFrame(
@@ -238,6 +318,16 @@ def main() -> None:
         ("回流表 HV 列 = 03/04/05 从回流名单吸收的人数", absorbed == len(ret_hv_keys), f"{absorbed:,} vs {len(ret_hv_keys):,}"),
         ("沉默高价值活跃与主表无交集", int((hv_state.eq(STATE_SILENT)).sum()) == 0, f"交集 {int((hv_state.eq(STATE_SILENT)).sum()):,} 人"),
         ("高价值活跃用户全部落在主表（沉默除外）", hv_in_main + len(silent_out) == len(hv_df), f"{hv_in_main:,} + {len(silent_out):,} vs {len(hv_df):,}"),
+        ("七类子表人数 = 主表命中人数", len(core) == int(counts.reindex(CORE_BUCKETS).fillna(0).sum()), f"{len(core):,} vs {int(counts.reindex(CORE_BUCKETS).fillna(0).sum()):,}"),
+        ("七类子表不含其它分群", set(core["最终分群"].unique()) <= set(CORE_BUCKETS), "、".join(sorted(set(core["最终分群"].unique()) - set(CORE_BUCKETS))) or "无越界值"),
+        ("偏好 TOP1 只写「有偏好」的用户", core_pref_station <= len(core) and core_pref_time <= len(core), f"站点 {core_pref_station:,} 人、时段 {core_pref_time:,} 人"),
+        ("「样本不足」的偏好三列全为「无」", bool(
+            (out.loc[out["站点偏好类型"].isin(NO_PREFERENCE_TYPES), PREFERENCE_STATION_COLUMNS] == NONE_FILL).all().all()
+            and (out.loc[out["时段偏好类型"].isin(NO_PREFERENCE_TYPES), PREFERENCE_TIME_COLUMNS] == NONE_FILL).all().all()
+        ), "站点、时段两侧各查一遍"),
+        ("偏好六列无空值（只可能是取值或「无」）", bool(
+            out[PREFERENCE_STATION_COLUMNS + PREFERENCE_TIME_COLUMNS].ne("").all().all()
+        ), "填不满的位置已统一写「无」，不留空串"),
     ]
     warn_checks = {"单桶人数 < 100 需告警"}
     check_df = pd.DataFrame(
@@ -252,11 +342,17 @@ def main() -> None:
     )
 
     out.to_csv(out_dir / "user_segments.csv", index=False, encoding="utf-8-sig", lineterminator="\n")
+    core.to_csv(out_dir / "user_segments_core7.csv", index=False, encoding="utf-8-sig", lineterminator="\n")
     silent_out.to_csv(out_dir / "user_segments_silent_high_value.csv", index=False, encoding="utf-8-sig", lineterminator="\n")
     overview.to_csv(out_dir / "user_segments_overview.csv", index=False, encoding="utf-8-sig", lineterminator="\n")
     check_df.to_csv(out_dir / "user_segments_checks.csv", index=False, encoding="utf-8-sig", lineterminator="\n")
 
+    core_counts = core["最终分群"].value_counts()
     print(overview.to_string(index=False))
+    print()
+    print("七类子表（user_segments_core7.csv）：")
+    print(pd.DataFrame([{"分群": name, "人数": int(core_counts.get(name, 0))} for name in CORE_BUCKETS]).to_string(index=False))
+    print(f"其中 站点偏好 TOP1 非「无」{core_pref_station:,} 人、时段偏好 TOP1 非「无」{core_pref_time:,} 人")
     print()
     print(check_df.to_string(index=False))
     print()

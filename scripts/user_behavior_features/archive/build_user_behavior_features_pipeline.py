@@ -1108,12 +1108,60 @@ def step_user_features_duckdb() -> None:
         )
         """
 
+    def top_station_cte() -> str:
+        """站点排行。除 top1 外还要吐 4 个集中度列，通用的 top_cte 只支持一列，故单独写。
+
+        这 4 列是 station_preference_type 判「双站点用户」「三站点用户」的依据；
+        缺了它们两个类型恒为 0 人。最小值按 pandas 版口径补零：
+        min(cnt1, cnt2, cnt3)，站点不足 3 个时缺的那个按 0 计。
+        """
+        return f"""
+        top_station_counts AS (
+            SELECT
+                {qid("用户识别主键")} AS 用户识别主键,
+                COALESCE(NULLIF(TRIM({qid("充电站ID")}), ''), {unknown}) AS value,
+                COUNT(*) AS cnt
+            FROM valid
+            WHERE COALESCE(NULLIF(TRIM({qid("充电站ID")}), ''), {unknown}) <> {unknown}
+            GROUP BY 1, 2
+        ),
+        top_station AS (
+            SELECT
+                用户识别主键,
+                MAX(CASE WHEN rn = 1 THEN value END) AS {qid("主站点ID")},
+                SUM(CASE WHEN rn = 1 THEN cnt ELSE 0 END) * 1.0 / MAX(total) AS {qid("主站点占比")},
+                MAX(unique_count) AS {qid("使用站点数")},
+                SUM(CASE WHEN rn <= 2 THEN cnt ELSE 0 END) * 1.0 / MAX(total) AS {qid("前二站点占比")},
+                SUM(CASE WHEN rn <= 3 THEN cnt ELSE 0 END) * 1.0 / MAX(total) AS {qid("前三站点占比")},
+                LEAST(
+                    MIN(CASE WHEN rn = 1 THEN cnt END),
+                    COALESCE(MIN(CASE WHEN rn = 2 THEN cnt END), 0)
+                ) * 1.0 / MAX(total) AS {qid("前二站点最小占比")},
+                LEAST(
+                    MIN(CASE WHEN rn = 1 THEN cnt END),
+                    COALESCE(MIN(CASE WHEN rn = 2 THEN cnt END), 0),
+                    COALESCE(MIN(CASE WHEN rn = 3 THEN cnt END), 0)
+                ) * 1.0 / MAX(total) AS {qid("前三站点最小占比")}
+            FROM (
+                SELECT
+                    用户识别主键,
+                    value,
+                    cnt,
+                    SUM(cnt) OVER (PARTITION BY 用户识别主键) AS total,
+                    COUNT(*) OVER (PARTITION BY 用户识别主键) AS unique_count,
+                    ROW_NUMBER() OVER (PARTITION BY 用户识别主键 ORDER BY cnt DESC, value) AS rn
+                FROM top_station_counts
+            )
+            GROUP BY 用户识别主键
+        )
+        """
+
     top_parts = [
         top_cte("top_period", "充电粗略时段", "主充电时段", "主充电时段占比"),
         top_cte("top_method", "充电方式", "常用充电方式", "常用充电方式占比", "充电方式数量"),
         top_cte("top_channel", "订单渠道", "常用订单渠道", "常用订单渠道占比", "订单渠道数量"),
         top_cte("top_source", "订单来源", "常用订单来源"),
-        top_cte("top_station", "充电站ID", "主站点ID", "主站点占比", "使用站点数"),
+        top_station_cte(),
         top_cte("top_pile", "充电桩编号", "常用充电桩编号", "常用充电桩占比", "使用充电桩数"),
         top_cte("top_reason", "异常原因类型", "主要异常原因", None, "异常原因类型数"),
     ]
@@ -1205,6 +1253,10 @@ def step_user_features_duckdb() -> None:
         COALESCE(top_station.{qid("主站点ID")}, '') AS {qid("主站点ID")},
         COALESCE(top_station.{qid("主站点占比")}, 0) AS {qid("主站点占比")},
         COALESCE(top_station.{qid("使用站点数")}, 0) AS {qid("使用站点数")},
+        COALESCE(top_station.{qid("前二站点占比")}, 0) AS {qid("前二站点占比")},
+        COALESCE(top_station.{qid("前三站点占比")}, 0) AS {qid("前三站点占比")},
+        COALESCE(top_station.{qid("前二站点最小占比")}, 0) AS {qid("前二站点最小占比")},
+        COALESCE(top_station.{qid("前三站点最小占比")}, 0) AS {qid("前三站点最小占比")},
         COALESCE(top_pile.{qid("常用充电桩编号")}, '') AS {qid("常用充电桩编号")},
         COALESCE(top_pile.{qid("常用充电桩占比")}, 0) AS {qid("常用充电桩占比")},
         COALESCE(top_pile.{qid("使用充电桩数")}, 0) AS {qid("使用充电桩数")},
